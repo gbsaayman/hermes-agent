@@ -560,6 +560,24 @@ export async function extractBridgeEvent({
     body = `[${mediaType} received]`;
   }
 
+  const readReceiptKey = {
+    // Preserve the original WAMessageKey, including LID/phone aliases and
+    // addressingMode. Baileys needs the original key for receipts.
+    ...(msg.key || {}),
+    remoteJid: msg.key?.remoteJid || chatId,
+    id: msg.key?.id,
+    fromMe: Boolean(msg.key?.fromMe),
+  };
+  if (!isGroup) {
+    // participant identifies the author inside a group; putting it on a
+    // private-chat receipt changes the receipt node shape and can make
+    // WhatsApp silently ignore the read receipt.
+    delete readReceiptKey.participant;
+    delete readReceiptKey.participantAlt;
+  } else if (!readReceiptKey.participant) {
+    readReceiptKey.participant = senderId;
+  }
+
   return {
     messageId: msg.key.id,
     chatId,
@@ -584,12 +602,7 @@ export async function extractBridgeEvent({
     quotedMediaType,
     hasQuotedMessage,
     botIds,
-    readReceiptKey: {
-      remoteJid: msg.key.remoteJid || chatId,
-      id: msg.key.id,
-      participant: msg.key.participant || senderId,
-      fromMe: Boolean(msg.key.fromMe),
-    },
+    readReceiptKey,
     timestamp: msg.messageTimestamp,
   };
 }
@@ -605,6 +618,33 @@ export function inboundReadReceiptKeys({ key, enabled }) {
   if (!enabled || !key || key.fromMe || !key.id || !key.remoteJid) return [];
   // Preserve participant for group messages: Baileys needs the original key.
   return [key];
+}
+
+export function readReceiptTypeForPrivacy(privacySettings) {
+  return privacySettings?.readreceipts === 'all' ? 'read' : 'read-self';
+}
+
+// Outbound reaction payload: Baileys sends reactions as
+// sendMessage(remoteJid, { react: { key, text } }); text '' removes one.
+// Returns null for anything that cannot address a real message — the HTTP
+// endpoint turns that into a 400 instead of sending garbage at WhatsApp.
+export function reactionPayloadFor(input) {
+  const { key, emoji } = input || {};
+  if (!key || typeof key !== 'object' || !key.id || !key.remoteJid) return null;
+  if (typeof emoji !== 'string') return null;
+  const text = emoji.trim();
+  if (!text && emoji.length > 0) return null; // whitespace-only emoji
+  return { react: { key, text } };
+}
+
+// Validate a /react request body: ``{chatId, key, emoji}``. Returns either
+// ``{chatId, payload}`` ready for sendMessage or ``{error}`` for the 400.
+export function reactionRequestFor(input) {
+  const { chatId, key, emoji } = input || {};
+  if (typeof chatId !== 'string' || !chatId.trim()) return { error: 'chatId required' };
+  const payload = reactionPayloadFor({ key, emoji });
+  if (!payload) return { error: 'key (id + remoteJid) and a string emoji are required' };
+  return { chatId, payload };
 }
 
 export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, fileName }) {

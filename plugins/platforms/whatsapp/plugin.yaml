@@ -19,6 +19,10 @@ optional_env:
     description: "Comma-separated WhatsApp user IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
     password: false
+  - name: WHATSAPP_OWNER_USERS
+    description: "Comma-separated WhatsApp user IDs granted owner-level gateway authorization; each must also be allowlisted"
+    prompt: "Owner users (comma-separated, optional)"
+    password: false
   - name: WHATSAPP_ALLOW_ALL_USERS
     description: "Allow any WhatsApp user to trigger the bot (dev only)"
     prompt: "Allow all users? (true/false)"

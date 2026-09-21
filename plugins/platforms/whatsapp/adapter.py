@@ -9,7 +9,9 @@ import platform
 import re
 import signal
 import subprocess
+import time
 from contextlib import suppress
+from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -229,7 +231,7 @@ def check_whatsapp_requirements() -> bool:
 
 # Env vars bridge.js consumes; injected because a multiplexed subprocess's os.environ lacks the secondary profile's .env.
 _BRIDGE_PASSTHROUGH_ENV = (
-    "WHATSAPP_ALLOWED_USERS", "WHATSAPP_ALLOW_FROM", "WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY",
+    "WHATSAPP_ALLOWED_USERS", "WHATSAPP_OWNER_USERS", "WHATSAPP_ALLOW_FROM", "WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY",
     "WHATSAPP_GROUP_ALLOWED_USERS", "WHATSAPP_GROUP_ALLOW_FROM", "WHATSAPP_REQUIRE_MENTION",
     "WHATSAPP_MENTION_PATTERNS", "WHATSAPP_FREE_RESPONSE_CHATS", "WHATSAPP_DEBUG",
     "WHATSAPP_FORWARD_OWNER_MESSAGES", "WHATSAPP_MAX_MESSAGE_LENGTH",
@@ -268,6 +270,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
 
+    # Processing-lifecycle reactions (Discord 👀/✅/❌ pattern). With all three set plus
+    # ``_add_reaction``/``_remove_reaction``, the inherited on_processing_complete swaps the
+    # in-progress 👀 for ✅/❌ (removed on CANCELLED). Gated by ``extra.reactions``.
+    _ACK_EMOJI = "👀"
+    _OK_EMOJI = "✅"
+    _FAIL_EMOJI = "❌"
+
+    _REACTION_KEYS_CACHE_LIMIT = 512
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
         if WhatsAppAdapter._DEFAULT_BRIDGE_DIR is None:
@@ -297,6 +308,130 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         # Telegram cadence and ceilings (#44883); ``0`` dispatches each message immediately.
         self._configure_text_batch_delays()
+        # Inbound message keys per message id, for /react targets (bounded LRU).
+        self._reaction_keys: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Pending interactive command menus: outbound menu message id → {token → command}.
+        # A quote-reply carrying just the token re-dispatches the mapped command.
+        self._command_menus: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Latest live menu per chat: a bare-number reply in-chat selects from it. WhatsApp
+        # users "reply" by just sending a message — requiring a swipe-quote lost selections.
+        self._chat_last_menu: Dict[str, str] = {}
+        self._command_menu_ttl = 24 * 3600.0
+        # Window in which a bare number after a menu counts as a selection (not conversation).
+        # Short by design: a pending clarify asking "reply 1 or 2" must not be hijacked.
+        self._menu_bare_window = self._coerce_float_extra("menu_bare_window_seconds", 120.0)
+
+    def _remember_command_menu(self, message_id: Optional[str], chat_id: str, mapping: Dict[str, str]) -> None:
+        """Register a sent command menu so a quote-reply token can select from it."""
+        if not message_id:
+            return
+        self._command_menus[str(message_id)] = {"chat_id": chat_id, "mapping": mapping, "ts": time.time(), "message_id": str(message_id)}
+        while len(self._command_menus) > self._REACTION_KEYS_CACHE_LIMIT:
+            self._command_menus.popitem(last=False)
+        self._chat_last_menu[chat_id] = str(message_id)
+
+    def _live_menu_for_chat(self, chat_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The chat's most recent still-live menu entry, else None (consumed/expired/evicted)."""
+        if not chat_id:
+            return None
+        message_id = self._chat_last_menu.get(chat_id)
+        if not message_id:
+            return None
+        menu = self._command_menus.get(message_id)
+        if not menu or time.time() - float(menu.get("ts", 0)) > self._command_menu_ttl:
+            self._chat_last_menu.pop(chat_id, None)
+            return None
+        return menu
+
+    def _pop_chat_menu_selection(self, event: "MessageEvent") -> Optional[str]:
+        """Bare-number selection from the chat's latest live menu, inside the fresh-window.
+        WhatsApp users reply to a menu by just sending a number; a bare "2" hours later
+        is conversation, not selection, so the window is short."""
+        menu = self._live_menu_for_chat(getattr(event.source, "chat_id", None))
+        if not menu:
+            return None
+        if time.time() - float(menu.get("ts", 0)) > self._menu_bare_window:
+            return None
+        token = self._menu_candidate_text(event)
+        if not re.fullmatch(r"[1-9][0-9]*", token):
+            return None
+        command = menu["mapping"].get(token)
+        if not command:
+            return None
+        self._forget_menu(menu)
+        return command
+
+    def _forget_menu(self, menu: Dict[str, Any]) -> None:
+        """Consume a menu: drop it from both indexes so it is single-use."""
+        chat_id, message_id = menu.get("chat_id"), menu.get("message_id")
+        if message_id:
+            self._command_menus.pop(message_id, None)
+        if chat_id and self._chat_last_menu.get(chat_id) == message_id:
+            self._chat_last_menu.pop(chat_id, None)
+
+    def _pop_command_menu_selection(self, event: "MessageEvent") -> Optional[str]:
+        """If this event is a quote-reply to a live command menu with a valid token,
+        return the mapped command (``/new``); the caller re-dispatches it as control traffic."""
+        quoted = str(getattr(event, "reply_to_message_id", "") or "")
+        if not quoted or len(self._command_menus) == 0:
+            return None
+        menu = self._command_menus.get(quoted)
+        if not menu:
+            return None
+        # Menus are quote-selectable only in the chat they were sent to.
+        if menu.get("chat_id") and menu["chat_id"] != getattr(event.source, "chat_id", None):
+            return None
+        token = self._menu_candidate_text(event)
+        if not re.fullmatch(r"[1-9][0-9]*", token):
+            return None
+        command = menu["mapping"].get(token)
+        if not command:
+            return None
+        if time.time() - float(menu.get("ts", 0)) > self._command_menu_ttl:
+            self._command_menus.pop(quoted, None)
+            return None
+        self._command_menus.pop(quoted, None)  # single-use menus
+        return command
+
+    def _menu_candidate_text(self, event: "MessageEvent") -> str:
+        """Event text with the owner prefix stripped: owner DMs carry it, and menu
+        interactions are control traffic, not transcript prose."""
+        text = (event.text or "").strip()
+        if text.startswith(_OWNER_REPLY_PREFIX):
+            text = text[len(_OWNER_REPLY_PREFIX):].strip()
+        return text
+
+    def _is_command_menu_request(self, event: "MessageEvent") -> bool:
+        """/menu (exact) requests the interactive menu. Adapter-local interception: the
+        registry of record lives in core, so a future core /menu would shadow this —
+        check COMMAND_REGISTRY before relying on this name."""
+        return self._menu_candidate_text(event).lower() == "/menu"
+
+    async def _send_command_menu(self, event: "MessageEvent") -> None:
+        text, mapping = self._build_whatsapp_command_menu()
+        result = await self.send(event.source.chat_id, text)
+        if result.success:
+            self._remember_command_menu(result.message_id, event.source.chat_id, mapping)
+
+    async def _dispatch_menu_command(self, event: "MessageEvent", command: str) -> None:
+        """Rewrite the event to the selected command and hand it to the gateway's normal
+        dispatch (idle slash handling, auth, notices) — the adapter never runs commands itself."""
+        event.text = command
+        await self.handle_message(event)
+
+    def _build_whatsapp_command_menu(self) -> tuple[str, Dict[str, str]]:
+        """Render the numbered WhatsApp command menu; returns (text, token→command)."""
+        entries = [
+            ("new", "🆕 New session"), ("status", "📊 Status"), ("commands", "📋 All commands"),
+            ("help", "❓ Help"), ("stop", "⏹ Stop background work"), ("restart", "🔄 Restart gateway"),
+        ]
+        lines = ["🧭 *Hermes command menu*", "Reply to this message with a number:"]
+        mapping: Dict[str, str] = {}
+        for idx, (name, desc) in enumerate(entries, start=1):
+            mapping[str(idx)] = f"/{name}"
+            lines.append(f"{idx}. {desc}")
+        lines.append("…or type any /command directly")
+        return "\n".join(lines), mapping
 
     def _bridge_url(self, path: str) -> str:
         return f"http://127.0.0.1:{self._bridge_port}/{path}"
@@ -694,6 +829,63 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(self._bridge_url("typing"), json={"chatId": to_whatsapp_jid(chat_id)}, timeout=aiohttp.ClientTimeout(total=5)):
                 pass
 
+    # ── Processing-lifecycle reactions (👀 → ✅/❌) via the bridge /react endpoint ──
+
+    def _reactions_enabled(self) -> bool:
+        """Reactions enabled via ``extra.reactions`` (YAML, per profile). Default off."""
+        value = self.config.extra.get("reactions")
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _remember_reaction_key(self, message_id: str, key: Dict[str, Any]) -> None:
+        """Record a received message's WAMessageKey so later acks can target it."""
+        if not message_id or not isinstance(key, dict):
+            return
+        self._reaction_keys[message_id] = dict(key)
+        while len(self._reaction_keys) > self._REACTION_KEYS_CACHE_LIMIT:
+            self._reaction_keys.popitem(last=False)
+
+    def _reaction_key_for(self, message_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+        """The remembered key for an inbound message, else a DM-shaped reconstruction."""
+        remembered = self._reaction_keys.get(message_id)
+        if remembered:
+            return remembered
+        return {"remoteJid": to_whatsapp_jid(chat_id), "id": message_id, "fromMe": False}
+
+    async def _post_reaction(self, chat_id: str, key: Optional[Dict[str, Any]], emoji: str) -> None:
+        if not self._http_session or not isinstance(key, dict) or not key.get("id"):
+            return
+        try:
+            async with self._bridge_req("post", "react", 5, json={"chatId": to_whatsapp_jid(chat_id), "key": key, "emoji": emoji}) as resp:
+                if resp.status != 200:
+                    logger.warning("[%s] WhatsApp reaction failed with HTTP %s", self.name, resp.status)
+        except Exception as exc:
+            logger.warning("[%s] WhatsApp reaction failed: %s", self.name, exc)
+
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> None:
+        key = self._reaction_key_for(message_id, chat_id)
+        await self._post_reaction(chat_id, key, emoji)
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> None:
+        # Send text '' on the same key — Baileys' documented reaction removal.
+        key = self._reaction_key_for(message_id, chat_id)
+        await self._post_reaction(chat_id, key, "")
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Add the 👀 in-progress reaction and remember the message key for later acks."""
+        if not self._reactions_enabled():
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        key = raw.get("readReceiptKey")
+        if isinstance(key, dict):
+            self._remember_reaction_key(str(message_id), key)
+        await self._add_reaction(chat_id, str(message_id), self._ACK_EMOJI or "👀")
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         if not self._running or not self._http_session:
             return {"name": "Unknown", "type": "dm"}
@@ -720,15 +912,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             try:
                 async with self._bridge_req("get", "messages", 30) as resp:
                     if resp.status == 200:
-                        for msg_data in await resp.json():
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                # Fire-and-forget: a slow bridge /read must not delay dispatch.
-                                asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                            for msg_data in await resp.json():
+                                event = await self._build_message_event(msg_data)
+                                if event:
+                                    # Fire-and-forget: a slow bridge /read must not delay dispatch.
+                                    asyncio.create_task(self._send_read_receipt(msg_data))
+                                    # Quote-reply to a live command menu with a bare number → dispatch
+                                    # the mapped slash command instead of bothering the model.
+                                    menu_command = self._pop_command_menu_selection(event)
+                                    if not menu_command and self._is_command_menu_request(event):
+                                        await self._send_command_menu(event)
+                                        continue
+                                    if not menu_command:
+                                        # Bare number right after a menu in the same chat = selection.
+                                        menu_command = self._pop_chat_menu_selection(event)
+                                    if menu_command:
+                                        await self._dispatch_menu_command(event, menu_command)
+                                        continue
+                                    if event.message_type == MessageType.TEXT:
+                                        self._enqueue_text_event(event)
+                                    else:
+                                        await self.handle_message(event)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -834,10 +1038,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         try:
             if not self._should_process_message(data):
                 return None
+            # User emoji-reactions are metadata, not prompts: intake drops them so the
+            # agent never answers "[Reaction: 👍 to …]" — and so the gateway's own 👀/✅
+            # acks can never loop back into a turn.
+            if str(data.get("mediaType") or "") == "reaction":
+                return None
             msg_type = self._classify_bridge_message(data)
+            from_owner = data.get("fromOwner") is True
             source = self.build_source(chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="group" if data.get("isGroup", False) else "dm",
                                        user_id=data.get("senderId"), user_name=data.get("senderName"),
-                                       message_id=data.get("messageId"))
+                                       message_id=data.get("messageId"), role_authorized=from_owner)
             cached_urls, media_types = await self._collect_bridge_media(data, msg_type)
             body = data.get("body", "")
             if data.get("isGroup"):
@@ -859,11 +1069,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 ("whatsapp_native_type", str(data.get("nativeType") or "").strip()),
                 ("whatsapp_native", native_metadata if isinstance(native_metadata, dict) else None),
             ) if v}
-            # ``fromOwner`` = owner-typed inbound fromMe (gated by WHATSAPP_FORWARD_OWNER_MESSAGES at the bridge); surfaced as
-            # metadata AND a text prefix so the marker survives downstream failures before silent_ingest.
-            if data.get("fromOwner"):
+            # ``fromOwner`` covers an explicitly configured owner DM and the separately gated
+            # linked-device owner-forwarding path. Surface it as metadata and canonical role authority.
+            if from_owner:
                 metadata["whatsapp_from_owner"] = True
-                if not body.startswith(_OWNER_REPLY_PREFIX):
+                # Slash commands are gateway control traffic, never transcript prose. The
+                # prefix would hide the leading "/" from MessageEvent.is_command() and leak
+                # /new, /stop, /approve, /restart to the model as literal text. Ownership is
+                # already carried by role_authorized + whatsapp_from_owner metadata.
+                if (
+                    not body.startswith(_OWNER_REPLY_PREFIX)
+                    and not body.lstrip().startswith("/")
+                ):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
             return MessageEvent(
                 text=body, message_type=msg_type, source=source, raw_message=data, message_id=data.get("messageId"),
@@ -1002,7 +1219,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("require_mention", "WHATSAPP_REQUIRE_MENTION", "lower"), ("dm_policy", "WHATSAPP_DM_POLICY", "lower"),
     ("group_policy", "WHATSAPP_GROUP_POLICY", "lower"), ("mention_patterns", "WHATSAPP_MENTION_PATTERNS", "json"),
     ("free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS", "csv"), ("allow_from", "WHATSAPP_ALLOWED_USERS", "csv"),
-    ("group_allow_from", "WHATSAPP_GROUP_ALLOWED_USERS", "csv"),
+    ("group_allow_from", "WHATSAPP_GROUP_ALLOWED_USERS", "csv"), ("reactions", "WHATSAPP_REACTIONS", "lower"),
 )
 
 

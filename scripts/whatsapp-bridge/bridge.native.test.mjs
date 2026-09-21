@@ -23,6 +23,9 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  reactionPayloadFor,
+  reactionRequestFor,
+  readReceiptTypeForPrivacy,
 } from './bridge_helpers.js';
 
 // -- inbound read receipts ------------------------------------------------
@@ -44,6 +47,64 @@ import {
   assert.equal(receiptKeys[0], groupKey);
   assert.equal(receiptKeys[0].participant, groupKey.participant);
   console.log('  ✓ inbound read receipts preserve the original group message key');
+}
+
+// -- read-receipt key shape ------------------------------------------------
+{
+  const dmEvent = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-dm-1',
+        remoteJid: '19121412534370@lid',
+        remoteJidAlt: '27832535312@s.whatsapp.net',
+        addressingMode: 'lid',
+        fromMe: false,
+      },
+      messageTimestamp: 123,
+      message: { conversation: 'DM receipt test' },
+    },
+    chatId: '19121412534370@lid',
+    senderId: '19121412534370@lid',
+    senderNumber: '27832535312',
+    downloadMedia: async () => Buffer.from(''),
+  });
+  assert.equal(dmEvent.readReceiptKey.remoteJid, '19121412534370@lid');
+  assert.equal(dmEvent.readReceiptKey.remoteJidAlt, '27832535312@s.whatsapp.net');
+  assert.equal(dmEvent.readReceiptKey.addressingMode, 'lid');
+  assert.equal(dmEvent.readReceiptKey.fromMe, false);
+  assert.equal(dmEvent.readReceiptKey.participant, undefined, 'private DM must not carry participant');
+
+  const groupEvent = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-group-1',
+        remoteJid: '120363001234567890@g.us',
+        participant: '19121412534370@lid',
+        participantAlt: '27832535312@s.whatsapp.net',
+        fromMe: false,
+      },
+      messageTimestamp: 123,
+      message: { conversation: 'Group receipt test' },
+    },
+    chatId: '120363001234567890@g.us',
+    senderId: '19121412534370@lid',
+    senderNumber: '27832535312',
+    isGroup: true,
+    downloadMedia: async () => Buffer.from(''),
+  });
+  assert.equal(groupEvent.readReceiptKey.participant, '19121412534370@lid');
+  assert.equal(groupEvent.readReceiptKey.participantAlt, '27832535312@s.whatsapp.net');
+
+  console.log('  ✓ read-receipt keys preserve LID aliases and omit participant for private DMs');
+}
+
+// -- effective read-receipt mode ------------------------------------------
+{
+  assert.equal(readReceiptTypeForPrivacy({ readreceipts: 'all' }), 'read');
+  assert.equal(readReceiptTypeForPrivacy({ readreceipts: 'none' }), 'read-self');
+  assert.equal(readReceiptTypeForPrivacy({}), 'read-self');
+  assert.equal(readReceiptTypeForPrivacy(null), 'read-self');
+  console.log('  ✓ privacy mode distinguishes sender-visible read from read-self');
 }
 
 // -- quoted outbound text -------------------------------------------------
@@ -132,7 +193,6 @@ import {
   assert.deepEqual(event.readReceiptKey, {
     id: 'incoming-1',
     remoteJid: '15551234567@s.whatsapp.net',
-    participant: '15550001111@s.whatsapp.net',
     fromMe: false,
   });
   assert.equal(event.hasQuotedMessage, true);
@@ -641,6 +701,59 @@ import {
   assert.equal(event.hasQuotedMessage, true);
   assert.equal(event.quotedText, 'Example appointment at 11:40');
   console.log('  ✓ nested envelopes: quote text resolves through both layers');
+}
+
+// -- outbound reactions ---------------------------------------------------
+{
+  const dmKey = { id: 'inbound-77', remoteJid: '15551234567@s.whatsapp.net', participant: undefined, fromMe: false };
+  const payload = reactionPayloadFor({ key: dmKey, emoji: '👀' });
+  assert.deepEqual(payload, { react: { key: dmKey, text: '👀' } });
+
+  // Group targets must keep the author participant on the reaction key.
+  const groupKey = { id: 'inbound-88', remoteJid: '120363001234567890@g.us', participant: '15550001111@s.whatsapp.net', fromMe: false };
+  assert.deepEqual(
+    reactionPayloadFor({ key: groupKey, emoji: '✅' }),
+    { react: { key: groupKey, text: '✅' } },
+  );
+
+  // Emoji sanitization: surrounding whitespace trimmed; the removal sentinel ('') stays an empty string.
+  assert.equal(reactionPayloadFor({ key: dmKey, emoji: ' 👀 ' }).react.text, '👀');
+  assert.equal(reactionPayloadFor({ key: dmKey, emoji: '' }).react.text, '');
+  // Whitespace-only emoji is ambiguous — fail closed rather than silently becoming a removal.
+  assert.equal(reactionPayloadFor({ key: dmKey, emoji: '   ' }), null);
+
+  // Invalid inputs fail closed with null: no key, or a non-string emoji.
+  assert.equal(reactionPayloadFor({ key: null, emoji: '👀' }), null);
+  assert.equal(reactionPayloadFor({ key: undefined, emoji: '👀' }), null);
+  assert.equal(reactionPayloadFor({ emoji: '👀' }), null);
+  assert.equal(reactionPayloadFor({ key: dmKey, emoji: 7 }), null);
+  assert.equal(reactionPayloadFor({ key: dmKey, emoji: null }), null);
+  assert.equal(reactionPayloadFor({ key: dmKey }), null);
+  assert.equal(reactionPayloadFor(null), null);
+  assert.equal(reactionPayloadFor({}), null);
+  // A key without an id cannot address a message.
+  assert.equal(reactionPayloadFor({ key: { remoteJid: '15551234567@s.whatsapp.net', fromMe: false }, emoji: '👀' }), null);
+
+  console.log('  ✓ outbound reactions: payload shape, emoji sanitize, fail-closed on bad input');
+}
+
+// -- /react request validation --------------------------------------------
+{
+  const dmKey = { id: 'inbound-77', remoteJid: '15551234567@s.whatsapp.net', fromMe: false };
+
+  const ok = reactionRequestFor({ chatId: '15551234567@s.whatsapp.net', key: dmKey, emoji: '👀' });
+  assert.deepEqual(ok, {
+    chatId: '15551234567@s.whatsapp.net',
+    payload: { react: { key: dmKey, text: '👀' } },
+  });
+
+  assert.ok(reactionRequestFor({ chatId: '', key: dmKey, emoji: '👀' }).error);
+  assert.ok(reactionRequestFor({ key: dmKey, emoji: '👀' }).error);
+  assert.ok(reactionRequestFor({ chatId: '15551234567@s.whatsapp.net', key: null, emoji: '👀' }).error);
+  assert.ok(reactionRequestFor({ chatId: '15551234567@s.whatsapp.net', emoji: '👀' }).error);
+  assert.ok(reactionRequestFor(null).error);
+
+  console.log('  ✓ /react request validation: chatId + valid reaction payload, else error');
 }
 
 console.log('\n✅ All WhatsApp native bridge helper tests passed.');

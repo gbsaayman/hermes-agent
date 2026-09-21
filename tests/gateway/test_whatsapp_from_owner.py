@@ -75,6 +75,7 @@ def test_metadata_flag_set_when_payload_has_from_owner():
 
     assert event is not None
     assert event.metadata.get("whatsapp_from_owner") is True
+    assert event.source.role_authorized is True
     assert event.text.startswith("[owner reply] ")
     assert event.text == "[owner reply] hi from the linked phone"
 
@@ -90,6 +91,43 @@ def test_from_owner_does_not_double_prefix_when_already_tagged():
 
     assert event is not None
     assert event.metadata.get("whatsapp_from_owner") is True
+    assert event.source.role_authorized is True
     assert event.text == "[owner reply] already tagged"
+
+
+def test_ordinary_message_is_not_role_authorized():
+    adapter = _make_adapter()
+
+    event = asyncio.run(adapter._build_message_event(_dm_payload()))
+
+    assert event is not None
+    assert event.metadata.get("whatsapp_from_owner") is None
+    assert event.source.role_authorized is False
+
+
+def test_owner_slash_command_is_not_prefixed():
+    """Owner slash commands stay pristine: a prefix would hide the leading "/"
+    from MessageEvent.is_command() and leak control traffic to the model."""
+    adapter = _make_adapter()
+
+    event = asyncio.run(adapter._build_message_event(_dm_payload(fromOwner=True, body="/new")))
+
+    assert event is not None
+    assert event.text == "/new"
+    assert event.is_command() is True
+    assert event.get_command() == "new"
+    assert event.source.role_authorized is True
+    assert event.metadata.get("whatsapp_from_owner") is True
+
+
+def test_owner_slash_command_with_leading_whitespace_is_not_prefixed():
+    adapter = _make_adapter()
+
+    event = asyncio.run(adapter._build_message_event(_dm_payload(fromOwner=True, body="  /stop")))
+
+    assert event is not None
+    assert event.is_command() is True
+    assert event.get_command() == "stop"
+    assert event.metadata.get("whatsapp_from_owner") is True
 
 

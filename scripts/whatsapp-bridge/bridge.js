@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedSender, matchesAllowedUser, matchesInboundWhatsAppGroup, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { isConfiguredOwnerDm } from './owner_identity.js';
 import {
   addMentions,
   buildPollPayload,
@@ -50,6 +51,8 @@ import {
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  reactionRequestFor,
+  readReceiptTypeForPrivacy,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -121,6 +124,7 @@ const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || ''
 // Group authorization is by group JID, not by every participant's JID.  The
 // Python adapter still applies group policy and mention rules after intake.
 const GROUP_ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_GROUP_ALLOWED_USERS || '');
+const OWNER_USERS = parseAllowedUsers(process.env.WHATSAPP_OWNER_USERS || '');
 const DEFAULT_REPLY_PREFIX = '☤ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -658,6 +662,14 @@ async function startSocket() {
           } catch {}
           continue;
         }
+        const senderAllowed = matchesAllowedSender(senderId, senderAltId, ALLOWED_USERS, SESSION_DIR);
+        fromOwner = senderAllowed && isConfiguredOwnerDm({
+          fromMe: false,
+          isGroup,
+          senderId,
+          ownerUsers: OWNER_USERS,
+          matchesUser: (id, users) => matchesAllowedSender(senderId, senderAltId, users, SESSION_DIR),
+        });
       }
 
       const messageContent = getMessageContent(msg);
@@ -1085,11 +1097,42 @@ app.post('/read', async (req, res) => {
   }
 
   try {
+    // ``readMessages`` itself derives this same mode from privacy settings;
+    // expose it so a successful HTTP call is not mistaken for a sender-visible
+    // blue tick. ``read-self`` only marks the linked account's own state.
+    const privacySettings = await sock.fetchPrivacySettings();
+    const readType = readReceiptTypeForPrivacy(privacySettings);
     await sock.readMessages(receiptKeys);
-    return res.json({ success: true, marked: true });
+    if (readType === 'read-self') {
+      console.warn('[bridge] read receipt dispatched as read-self; sender will not receive a blue tick while Read Receipts privacy is disabled');
+    } else {
+      console.log('[bridge] read receipt dispatched as read');
+    }
+    return res.json({ success: true, marked: true, readType });
   } catch (err) {
     console.warn('[bridge] failed to send read receipt:', err.message);
     return res.status(500).json({ error: 'Failed to send read receipt' });
+  }
+});
+
+// Send or remove an emoji reaction on a received message. Removal = emoji ''.
+// The key must be the original WAMessageKey of the target message (participant
+// included for groups); the read-receipt key of an inbound event is exactly that.
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const validated = reactionRequestFor(req.body);
+  if (validated.error) {
+    return res.status(400).json({ error: validated.error });
+  }
+
+  try {
+    await sendWithTimeout(validated.chatId, validated.payload);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1127,6 +1170,7 @@ app.get('/health', (req, res) => {
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
     capabilities: { outboundMentions: true },
+    ownerUsersConfigured: OWNER_USERS.size,
   });
 });
 
@@ -1161,6 +1205,9 @@ if (PAIR_ONLY) {
       console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
       console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
+    }
+    if (WHATSAPP_MODE === 'bot' && OWNER_USERS.size > 0) {
+      console.log(`👑 WHATSAPP_OWNER_USERS configured (${OWNER_USERS.size} owner identity/identities)`);
     }
     if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
